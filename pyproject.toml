@@ -52,7 +52,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/robocurve/inspect-robots-yam"
+Homepage = "https://github.com/Dreamscale-Labs/inspect-robots-yam"
+Upstream = "https://github.com/robocurve/inspect-robots-yam"
 Framework = "https://github.com/robocurve/inspect-robots"
 Collection = "https://github.com/robocurve/worldevals"
 

@@ -19,6 +19,13 @@ Run [Inspect Robots](https://github.com/robocurve/inspect-robots) evals on real
 > [!NOTE]
 > This project is in early development. The API may change between releases, so pin a version before depending on it.
 
+> [!NOTE]
+> This is Dreamscale Labs' hardware integration fork, based on upstream commit
+> `d444fa9ed536d47e659a77e273a72571ff8427d3`. Its additive preparation,
+> source-timestamp, and strict abort behavior is used by the detachable
+> `inspect-robots-dropbear-yam` composition. Upstream behavior remains the
+> default unless strict mode is explicitly enabled.
+
 Inspect Robots has two swappable inputs: a `Policy` (the VLA brain) and an
 `Embodiment` (the robot body + world). This package provides both for the
 YAM + MolmoAct2 stack, so any embodiment-agnostic Inspect Robots task (e.g. all of
@@ -55,6 +62,9 @@ frame rate, which no setting here changes (a 5 fps camera means 200 ms whatever
 the control rate), and a camera that stops delivering for half a second raises
 rather than serving a stale frame. A custom `camera_reader` that owns devices
 should expose a `close()`, which the embodiment calls during teardown.
+Each builtin backend also carries each image's distinct host Unix-epoch
+acquisition time in `Observation.image_times`. The existing 500 ms freshness
+check continues to use a separate monotonic publication time.
 
 ## Install (on the robot/GPU machine)
 
@@ -564,6 +574,29 @@ summed command inside the embodiment as a backstop. A delta-configured rig
 must be paired with a delta-declaring policy (`-P joints_are_delta=true` for
 `molmoact2`); a mismatch fails the compatibility check before any motion.
 
+## Dreamscale preparation and strict policy mode
+
+`YAMEmbodiment.prepare_observation()` opens the configured cameras and I2RT
+driver and returns a real observation without homing or calling
+`command_joint_pos`. Normal I2RT construction enables control traffic and
+calibrates `LINEAR_4310` grippers. The same driver is retained for the later
+`reset()`, so calibration occurs once. Call this only after an attended
+e-stop and gripper-calibration gate.
+
+`YamConfig(strict_policy_actions=True)` adds an absolute-joint-only policy
+boundary. It requires exactly 14 finite values inside the configured joint
+bounds. The first target is compared with freshly measured post-reset state;
+later targets are compared with the last successfully sent policy target.
+Changes above `step_limits` abort, with defaults of 0.2 rad for arm joints and
+one normalized gripper stroke. A rejected target is not clamped, interpolated,
+held, rewritten, or sent. The reference changes only after the driver command
+succeeds and resets from fresh state on every trial.
+
+Strict mode also changes the contributed predictive collision response from a
+hold to `SafetyAbort`. The normal clamp and collision-hold behavior remains
+unchanged when strict mode is off. A composition using strict mode should not
+add Inspect's default clamp or delta-rewriting approvers around policy actions.
+
 ## Collision guardrail
 
 `YamConfig.collision_guardrail` defaults to `True`. In absolute joint mode,
@@ -640,7 +673,9 @@ motions, or replace the operator and physical e-stop.
   limits** (the defaults are conservative placeholders: joints ±π, gripper 0–1).
   But note the limits are in *policy units* per the table below: gripper slots 6
   and 13 stay normalized 0–1, only slots 0–5 and 7–12 are radians.
-- **Use `ClampApprover`** on hardware for a second layer.
+- **Use `ClampApprover`** on hardware for a second layer in normal mode. The
+  Dreamscale strict mode rejects rather than rewrites and must use its
+  abort-only guardrail chain instead.
 - **Zero-gravity handoff jump.** The arms connect in zero-gravity mode by default
   (`YamConfig(zero_gravity_mode=True)`, passed through to the i2rt driver).
   Homing and rest-pose motions ramp at `control_hz`, but the first *policy*
@@ -749,7 +784,9 @@ to the factory zero-joint, open-gripper pose equal to the joint factory home,
 accepts a per-rig override, and accepts `none` to fall back to the pose captured
 at the first reset before torque is released),
 `rest_secs` (ramp duration, default 3.0), `gripper_open/closed`,
-`joints_are_delta`, `zero_gravity_mode` (default `True`; see *Safety*),
+`joints_are_delta`, `strict_policy_actions` (default `False`; abort-only finite,
+bounds, and per-step validation for absolute joint policy actions),
+`zero_gravity_mode` (default `True`; see *Safety*),
 `unattended` (default `False`; skip operator prompts),
 `auto_start` (default `False`; skip both operator Enter gates but keep the
 attended episode flow; needs a TTY; `unattended` takes precedence),

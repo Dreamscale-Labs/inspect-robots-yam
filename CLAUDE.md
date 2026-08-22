@@ -61,6 +61,8 @@ because absolute joint conformance permits only one 14-D state field.
 
 - `YAMEmbodiment.step()` **always clamps** to `YamConfig.joint_low/high` before
   commanding, independent of any `Approver`. This is the last line of defense.
+  In opt-in `strict_policy_actions` mode, finite/bounds/jump checks abort first,
+  so the clamp receives an already-in-bounds target and cannot rewrite it.
 - The declared `control_mode` is `joint_pos` for absolute joint mode,
   `joint_delta` when `joints_are_delta=True`, and `eef_abs_pose` in EEF mode.
   Delta joint commands are converted to absolute *inside* `step()` before the

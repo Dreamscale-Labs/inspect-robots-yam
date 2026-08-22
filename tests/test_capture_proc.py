@@ -79,6 +79,7 @@ def _fake_subprocess_child(conn: Any, spec: _CaptureSpec) -> None:
                 intrinsics=np.eye(3, dtype=np.float32),
                 depth_scale=0.001,
                 published_s=time.monotonic(),
+                captured_epoch_s=time.time(),
                 generation=spec.generation,
             )
         conn.send(("ready", None))
@@ -156,6 +157,7 @@ def _publish(
         intrinsics=intrinsics,
         depth_scale=0.001,
         published_s=12.5,
+        captured_epoch_s=1_700_000_000.25,
         generation=3,
     )
 
@@ -163,7 +165,7 @@ def _publish(
 def test_frame_layout_round_trip_and_views_do_not_block_close() -> None:
     shm, spec = _create_frame_slot(4, 3)
     try:
-        assert spec.layout.nbytes == 32 + 4 * 3 * 3 + 4 * 3 * 2 + 3 * 3 * 4
+        assert spec.layout.nbytes == 40 + 4 * 3 * 3 + 4 * 3 * 2 + 3 * 3 * 4
         assert _read_frame(shm, spec) is None
 
         _publish(shm, spec)
@@ -176,6 +178,7 @@ def test_frame_layout_round_trip_and_views_do_not_block_close() -> None:
         np.testing.assert_array_equal(snapshot.intrinsics, intrinsics)
         assert snapshot.depth_scale == 0.001
         assert snapshot.published_s == 12.5
+        assert snapshot.captured_epoch_s == 1_700_000_000.25
         assert snapshot.generation == 3
         arrays = (snapshot.colour, snapshot.depth, snapshot.intrinsics)
         assert all(array.flags.owndata for array in arrays)
@@ -236,6 +239,7 @@ def test_failed_publication_stays_marked_torn() -> None:
                 intrinsics=intrinsics,
                 depth_scale=0.001,
                 published_s=0.0,
+                captured_epoch_s=1_700_000_000.0,
                 generation=1,
             )
 
@@ -764,7 +768,8 @@ def test_child_opens_warms_publishes_and_stops_in_process(
         expected: list[tuple[str, str]] = (
             [] if supports_track else [(f"/{slot_spec.name}", "shared_memory")]
         )
-        assert unregisters == expected
+        shared_memory_unregisters = [entry for entry in unregisters if entry[1] == "shared_memory"]
+        assert shared_memory_unregisters == expected
     finally:
         parent_conn.close()
         shm.close()

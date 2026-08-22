@@ -143,6 +143,7 @@ class FakeTransport:
         self.is_alive = False
         self.generation = 0
         self.published_s = 0.0
+        self.captured_epoch_s = 1_700_000_000.0
         self.colour = np.dstack([np.full((480, 640), value, dtype=np.uint8) for value in (1, 2, 3)])
         self.depth = np.full((480, 640), 500, dtype=np.uint16)
         self.intrinsics = np.array(
@@ -173,6 +174,7 @@ class FakeTransport:
             intrinsics=self.intrinsics.copy(),
             depth_scale=self.depth_scale,
             published_s=self.published_s,
+            captured_epoch_s=self.captured_epoch_s,
             generation=self.generation,
         )
 
@@ -295,6 +297,7 @@ def test_process_reader_is_lazy_and_matches_image_depth_and_intrinsics() -> None
 
     assert transport.opens == [1]
     assert set(images) == set(SERIALS)
+    assert images.image_times == dict.fromkeys(SERIALS, 1_700_000_000.0)
     assert all(image.shape == (4, 4, 3) for image in images.values())
     assert all(list(image[0, 0]) == [1, 2, 3] for image in images.values())
     expected_intrinsics = np.array(
@@ -776,6 +779,16 @@ def test_raw_sdk_buffers_are_copied_before_publication() -> None:
 
     assert pair.colour[0, 0, 0] == 4
     assert pair.depth[0, 0] == 900
+    assert pair.captured_epoch_s > 1_000_000_000
+
+
+def test_inline_reader_returns_source_epoch_time_for_every_camera() -> None:
+    reader, _, _, _, _ = build()
+
+    images = reader(cfg())
+
+    assert set(images.image_times) == set(SERIALS)
+    assert all(value > 1_000_000_000 for value in images.image_times.values())
 
 
 def test_extra_can_open_first_and_modules_are_resolved_lazily(

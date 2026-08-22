@@ -413,6 +413,17 @@ def test_strict_mode_and_nonfinite_action_abort(
         strict.review(Action(bad), {})
 
 
+def test_strict_embodiment_contributes_abort_only_collision_approver(
+    joint_space: Box,
+) -> None:
+    contribution = YAMEmbodiment(YamConfig(strict_policy_actions=True)).contribute_guardrails(
+        joint_space
+    )
+
+    _, approver = contribution.approvers[0]
+    assert approver._on_violation == "abort"
+
+
 def test_resolution_derived_substeps_clamp_at_one_and_sixty_four(
     checker: CollisionChecker,
     joint_space: Box,
