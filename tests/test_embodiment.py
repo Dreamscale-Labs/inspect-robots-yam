@@ -591,6 +591,27 @@ def test_validate_policy_action_requires_strict_mode() -> None:
         emb.validate_policy_action(Action(np.zeros(14)), reference=np.zeros(14))
 
 
+@pytest.mark.parametrize("reference", [np.zeros(13), np.full(14, np.nan)])
+def test_validate_policy_action_rejects_invalid_explicit_reference_without_sending(
+    reference: np.ndarray,
+) -> None:
+    driver = FakeDriver()
+    emb = YAMEmbodiment(
+        YamConfig(cam_height=4, cam_width=4, strict_policy_actions=True),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    emb.prepare_observation("shadow")
+
+    with pytest.raises(SafetyAbort, match=r"reference.*exactly 14 finite"):
+        emb.validate_policy_action(Action(np.zeros(14)), reference=reference)
+
+    assert driver.commands == []
+
+
 def test_strict_policy_actions_compare_later_targets_with_last_accepted_target() -> None:
     emb, driver = _strict_build()
     first = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
