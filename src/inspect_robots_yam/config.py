@@ -180,6 +180,11 @@ class YamConfig(_FromKwargs):
     gripper_closed: float = 0.0
     joints_are_delta: bool = False
     step_limits: tuple[float, ...] = _DEFAULT_STEP_LIMITS
+    # Opt-in policy boundary for attended physical runs. Absolute policy targets
+    # must be finite, inside joint bounds, and within step_limits of the freshly
+    # measured post-reset state or last successfully commanded target. Rejected
+    # actions abort instead of being clamped, held, or rewritten.
+    strict_policy_actions: bool = False
     zero_gravity_mode: bool = True
     unattended: bool = False
     # Skip both operator Enter gates in reset(): the stand-clear home gate is
@@ -291,6 +296,7 @@ class YamConfig(_FromKwargs):
             "collision_table",
             "report_joint_eff",
             "park_before_grade",
+            "strict_policy_actions",
         ):
             if flag in flat and not isinstance(flat[flag], bool):
                 raise ValueError(f"{flag} must be true or false, got {flat[flag]!r}")
@@ -329,6 +335,13 @@ class YamConfig(_FromKwargs):
         if self.control_interface == "eef_pos" and self.joints_are_delta:
             raise ValueError(
                 "joints_are_delta=True is incompatible with control_interface='eef_pos'"
+            )
+        if self.strict_policy_actions and (
+            self.control_interface != "joints" or self.joints_are_delta
+        ):
+            raise ValueError(
+                "strict_policy_actions=True requires absolute joint control "
+                "(control_interface='joints', joints_are_delta=False)"
             )
         for name in ("joint_low", "joint_high"):
             if len(getattr(self, name)) != TOTAL_DIM:

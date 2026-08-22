@@ -36,7 +36,7 @@ import numpy.typing as npt
 from inspect_robots.approver import GuardrailContribution
 from inspect_robots.conformance import DeviceSlot, OptionSlot
 from inspect_robots.embodiment import SELF_PACED, EmbodimentInfo
-from inspect_robots.errors import ConfigError, EmbodimentFault
+from inspect_robots.errors import ConfigError, EmbodimentFault, SafetyAbort
 from inspect_robots.scene import Scene
 from inspect_robots.spaces import Box
 from inspect_robots.types import OPERATOR_END, Action, Observation, StepResult
@@ -76,6 +76,24 @@ from inspect_robots_yam.operator import (
 
 ImageMap = Mapping[str, npt.NDArray[np.uint8]]
 Vec = npt.NDArray[np.float64]
+
+
+@dataclass(frozen=True)
+class _CapturedImages(Mapping[str, npt.NDArray[np.uint8]]):
+    """Image mapping plus each frame's host Unix-epoch acquisition time."""
+
+    images: Mapping[str, npt.NDArray[np.uint8]]
+    image_times: Mapping[str, float]
+
+    def __getitem__(self, key: str) -> npt.NDArray[np.uint8]:
+        return self.images[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.images)
+
+    def __len__(self) -> int:
+        return len(self.images)
+
 
 _DOCS_JOINTS = """Two identical 6-DoF arms, prefixed left_ and right_, each with a parallel-jaw
 gripper. Each arm has its own base frame: +x points forward out of the base
@@ -212,7 +230,7 @@ _ARM_SLOTS = np.array(
 
 DriverFactory = Callable[[YamConfig], BimanualDriver]
 KinematicsFactory = Callable[[YamConfig], tuple[RawKinematics, RawKinematics]]
-CameraReader = Callable[[YamConfig], ImageMap]
+CameraReader = Callable[[YamConfig], ImageMap | _CapturedImages]
 DepthReader = Callable[[YamConfig], dict[str, Any]]
 
 
@@ -386,6 +404,7 @@ class _Published:
 
     data: Any
     published_s: float
+    captured_epoch_s: float
 
 
 @dataclass(frozen=True)
@@ -406,6 +425,7 @@ class _PublishedPair:
     intrinsics: npt.NDArray[np.float32]
     depth_scale: float
     published_s: float
+    captured_epoch_s: float
 
 
 class _OpenCVCameraReader:
@@ -441,11 +461,13 @@ class _OpenCVCameraReader:
         cv2_module: Any | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        epoch_clock: Callable[[], float] = time.time,
     ) -> None:
         self._devices = dict(devices)
         self._cv2 = cv2_module
         self._sleep = sleep_fn
         self._clock = clock
+        self._epoch_clock = epoch_clock
         self._caps: dict[str, Any] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._published: dict[str, _Published] = {}
@@ -461,13 +483,17 @@ class _OpenCVCameraReader:
         # no window between the check and the write.
         self._generation = 0
 
-    def __call__(self, cfg: YamConfig) -> ImageMap:
+    def __call__(self, cfg: YamConfig) -> _CapturedImages:
         """Return the newest frame from every camera, opening devices on first use."""
         cv2 = self._cv2 if self._cv2 is not None else _import_cv2()
         self._cv2 = cv2
         if not self._caps:
             self._open_all(cv2)
-        return {name: self._latest(cv2, name, cfg) for name in self._devices}
+        captures = {name: self._latest_capture(cv2, name, cfg) for name in self._devices}
+        return _CapturedImages(
+            images={name: capture[0] for name, capture in captures.items()},
+            image_times={name: capture[1] for name, capture in captures.items()},
+        )
 
     def close(self) -> None:
         """Stop every drain thread, then release the captures it owned.
@@ -603,10 +629,20 @@ class _OpenCVCameraReader:
         with self._lock:
             if generation != self._generation:
                 return
-            self._published[name] = _Published(copy, self._clock())
+            self._published[name] = _Published(
+                copy,
+                self._clock(),
+                self._epoch_clock(),
+            )
 
     def _latest(self, cv2: Any, name: str, cfg: YamConfig) -> npt.NDArray[np.uint8]:
         """Convert the newest published frame, waiting briefly for a fresh one."""
+        return self._latest_capture(cv2, name, cfg)[0]
+
+    def _latest_capture(
+        self, cv2: Any, name: str, cfg: YamConfig
+    ) -> tuple[npt.NDArray[np.uint8], float]:
+        """Return one converted frame with its source Unix-epoch acquisition time."""
         device = self._devices[name]
         for _ in range(10):
             with self._lock:
@@ -617,7 +653,7 @@ class _OpenCVCameraReader:
             if published is not None and self._clock() - published.published_s <= (
                 self.MAX_FRAME_AGE_S
             ):
-                return self._convert(cv2, published.data, cfg)
+                return self._convert(cv2, published.data, cfg), published.captured_epoch_s
             self._sleep(0.05)
         raise RuntimeError(f"frame read failed for {name} ({device})")
 
@@ -669,6 +705,7 @@ class _RealsenseCameraReader:
         cv2_module: Any | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        epoch_clock: Callable[[], float] = time.time,
     ) -> None:
         self._serials = dict(serials)
         self._depth_fps = depth_fps
@@ -676,6 +713,7 @@ class _RealsenseCameraReader:
         self._cv2 = cv2_module
         self._sleep = sleep_fn
         self._clock = clock
+        self._epoch_clock = epoch_clock
         self._bundles: dict[str, _PipelineBundle] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._published: dict[str, _PublishedPair] = {}
@@ -684,17 +722,19 @@ class _RealsenseCameraReader:
         self._stop = threading.Event()
         self._generation = 0
 
-    def __call__(self, cfg: YamConfig) -> ImageMap:
+    def __call__(self, cfg: YamConfig) -> _CapturedImages:
         """Return the newest RGB frame from every camera, opening them on first use."""
         self._ensure_open()
         cv2 = self._cv2 if self._cv2 is not None else _import_cv2()
         self._cv2 = cv2
         images: dict[str, npt.NDArray[np.uint8]] = {}
+        image_times: dict[str, float] = {}
         for name in self._serials:
             pair, _ = self._latest(name)
             resized = cv2.resize(pair.colour, (cfg.cam_width, cfg.cam_height))
             images[name] = np.asarray(resized).astype(np.uint8)
-        return images
+            image_times[name] = pair.captured_epoch_s
+        return _CapturedImages(images, image_times)
 
     def extra(self, cfg: YamConfig) -> dict[str, Any]:
         """Return scaled camera matrices and generation-bound lazy depth arrays."""
@@ -927,6 +967,7 @@ class _RealsenseCameraReader:
                 intrinsics=k_matrix,
                 depth_scale=depth_scale,
                 published_s=self._clock(),
+                captured_epoch_s=self._epoch_clock(),
             )
 
     def _latest(
@@ -994,17 +1035,19 @@ class _ProcessRealsenseCameraReader:
         self._generation = 0
         self._closed = False
 
-    def __call__(self, cfg: YamConfig) -> ImageMap:
+    def __call__(self, cfg: YamConfig) -> _CapturedImages:
         """Return the newest RGB frame from every isolated camera."""
         self._ensure_open()
         cv2 = self._cv2 if self._cv2 is not None else _import_cv2()
         self._cv2 = cv2
         images: dict[str, npt.NDArray[np.uint8]] = {}
+        image_times: dict[str, float] = {}
         for name in self._serials:
             snapshot = self._latest(name)
             resized = cv2.resize(snapshot.colour, (cfg.cam_width, cfg.cam_height))
             images[name] = np.asarray(resized).astype(np.uint8)
-        return images
+            image_times[name] = snapshot.captured_epoch_s
+        return _CapturedImages(images, image_times)
 
     def extra(self, cfg: YamConfig) -> dict[str, Any]:
         """Return rescaled camera matrices and generation-bound depth thunks."""
@@ -1112,12 +1155,16 @@ class _CompositeCameraReader:
     def __init__(self, *readers: CameraReader) -> None:
         self._readers = readers
 
-    def __call__(self, cfg: YamConfig) -> ImageMap:
+    def __call__(self, cfg: YamConfig) -> _CapturedImages:
         """Return the union of every wrapped reader's camera images."""
         images: dict[str, npt.NDArray[np.uint8]] = {}
+        image_times: dict[str, float] = {}
         for reader in self._readers:
-            images.update(reader(cfg))
-        return images
+            captured = reader(cfg)
+            images.update(captured)
+            if isinstance(captured, _CapturedImages):
+                image_times.update(captured.image_times)
+        return _CapturedImages(images, image_times)
 
     def close(self) -> None:
         """Close every wrapped reader that exposes a duck-typed close method."""
@@ -1261,6 +1308,7 @@ class YAMEmbodiment:
         self._depth_reader: DepthReader | None = depth_reader
 
         self._driver: BimanualDriver | None = None
+        self._strict_reference: Vec | None = None
         self._left_kinematics: _ArmKinematics | None = None
         self._right_kinematics: _ArmKinematics | None = None
         self._eef_home_validated = False
@@ -1366,7 +1414,11 @@ class YAMEmbodiment:
                 )
             )
 
-        approver = _collision_approver(self._cfg, action_space)
+        approver = _collision_approver(
+            self._cfg,
+            action_space,
+            on_violation="abort" if self._cfg.strict_policy_actions else "hold",
+        )
         warnings: tuple[str, ...] = ()
         if self._cfg.collision_left_base_pos is None or self._cfg.collision_right_base_pos is None:
             defaulted = (
@@ -1458,14 +1510,7 @@ class YAMEmbodiment:
         # Fail fast on an unusable camera_reader BEFORE connecting the driver or
         # commanding any motion: this is a pure configuration error. `not callable`
         # also catches a CLI-injected scalar (`-E camera_reader=...` binds a str).
-        if self._camera_reader is _default_camera_reader or not callable(self._camera_reader):
-            raise ConfigError(
-                "yam_arms has no cameras configured. Set exactly one source per "
-                "camera slot: *_cam_device for V4L2 colour or *_depth_serial for "
-                "RealSense colour+depth, in YamConfig, config.ini "
-                "([embodiment.args]), or the CLI; or provide a custom "
-                "camera_reader= via the Python API."
-            )
+        self._require_camera_configuration()
         # auto_start still needs stdin: the end-episode keypress and the
         # framework's grading prompt both read it. wait_ready() normally
         # fail-fasts a dead stdin before any motion; with the gates skipped,
@@ -1479,28 +1524,28 @@ class YAMEmbodiment:
                 "YamConfig(unattended=True) (CLI: -E unattended=true) for "
                 "headless runs."
             )
-        if self._driver is None:
-            if self._cfg.start_pose is not None and self._resolved_start_pose is None:
-                stored = poses.load_pose(self._cfg.pose_dir, self._cfg.start_pose)
-                resolved = np.asarray(stored.joints, dtype=np.float64)
-                bad = np.flatnonzero((resolved < self._cfg.low) | (resolved > self._cfg.high))
-                if bad.size:
-                    details = ", ".join(
-                        f"{int(index)}: {resolved[index]} vs "
-                        f"[{self._cfg.low[index]}, {self._cfg.high[index]}]"
-                        for index in bad
-                    )
-                    raise ValueError(
-                        f"start pose {stored.name!r} is outside configured joint bounds at "
-                        f"packed indices {bad.tolist()}: {details}"
-                    )
-                resolved.setflags(write=False)
-                self._resolved_start_pose = resolved
-                logger.info(
-                    "resolved start pose %r from %s",
-                    stored.name,
-                    poses.pose_path(self._cfg.pose_dir, stored.name),
+        if self._cfg.start_pose is not None and self._resolved_start_pose is None:
+            stored = poses.load_pose(self._cfg.pose_dir, self._cfg.start_pose)
+            resolved = np.asarray(stored.joints, dtype=np.float64)
+            bad = np.flatnonzero((resolved < self._cfg.low) | (resolved > self._cfg.high))
+            if bad.size:
+                details = ", ".join(
+                    f"{int(index)}: {resolved[index]} vs "
+                    f"[{self._cfg.low[index]}, {self._cfg.high[index]}]"
+                    for index in bad
                 )
+                raise ValueError(
+                    f"start pose {stored.name!r} is outside configured joint bounds at "
+                    f"packed indices {bad.tolist()}: {details}"
+                )
+            resolved.setflags(write=False)
+            self._resolved_start_pose = resolved
+            logger.info(
+                "resolved start pose %r from %s",
+                stored.name,
+                poses.pose_path(self._cfg.pose_dir, stored.name),
+            )
+        if self._driver is None:
             self._driver = self._driver_factory(self._cfg)
         if self._cfg.control_interface == "eef_pos" and (
             self._left_kinematics is None or self._right_kinematics is None
@@ -1606,7 +1651,42 @@ class YAMEmbodiment:
                 self._status(f"Running: press any key to end the episode and grade it.{limit}")
         self.num_steps = 0
         self._t_last = self._clock()
-        return self._observe(scene.instruction)
+        observation = self._observe(scene.instruction)
+        if self._cfg.strict_policy_actions:
+            self._strict_reference = np.asarray(
+                observation.state[packing.STATE_KEY], dtype=np.float64
+            ).copy()
+        return observation
+
+    def prepare_observation(self, instruction: str | None = None) -> Observation:
+        """Connect cameras and I2RT, then observe without commanding an arm pose.
+
+        Constructing the normal I2RT driver enables its control traffic and
+        calibrates configured ``LINEAR_4310`` grippers. The connection is kept
+        for the later :meth:`reset`, so that calibration happens once. This
+        method never homes and never calls ``command_joint_pos``.
+        """
+        self._require_camera_configuration()
+        if self._driver is None:
+            self._driver = self._driver_factory(self._cfg)
+        return self._observe(instruction)
+
+    def validate_policy_action(
+        self,
+        action: Action,
+        *,
+        reference: npt.ArrayLike | None = None,
+    ) -> Vec:
+        """Validate one strict action without commanding or changing guard state.
+
+        ``reference`` lets a pre-home shadow inference be checked against the
+        real state returned by :meth:`prepare_observation`. When omitted, the
+        live post-reset/last-accepted strict reference is used. The method is
+        intentionally unavailable outside opt-in strict policy-action mode.
+        """
+        if not self._cfg.strict_policy_actions:
+            raise RuntimeError("validate_policy_action requires strict_policy_actions=True")
+        return self._strict_policy_target(action.data, reference=reference).copy()
 
     def step(self, action: Action) -> StepResult:
         """Clamp + command one action, pace to the control rate, then maybe end."""
@@ -1616,7 +1696,10 @@ class YAMEmbodiment:
             cmd = packing.validate_dim(action.data, len(EEF_DIM_LABELS))
             target = self._step_eef(cmd, driver)
         else:
-            cmd = packing.validate_dim(action.data)
+            if self._cfg.strict_policy_actions:
+                cmd = self._strict_policy_target(action.data)
+            else:
+                cmd = packing.validate_dim(action.data)
             if self._cfg.joints_are_delta:
                 # Normalize the gripper slots of the current position first, so
                 # the delta is applied in policy units (a fraction of the
@@ -1625,6 +1708,8 @@ class YAMEmbodiment:
                 base = self._norm_grippers(packing.validate_dim(driver.get_joint_pos()))
                 cmd = base + cmd
             target = self._send(cmd)
+            if self._cfg.strict_policy_actions:
+                self._strict_reference = target.copy()
         # Before _pace(), so a settle that finishes inside the control period
         # costs nothing: the pace simply sleeps out whatever is left.
         settle_info = self._settle_info(self._settle(target))
@@ -1678,13 +1763,12 @@ class YAMEmbodiment:
             if not self._cfg.unattended:
                 self._status(None)
         observation = self._observe(None)
-        # image_times/state_time are deliberately left at their defaults: the
-        # source observation never sets them today, and a future _observe that
-        # does should extend this rebuild rather than lose them silently.
         return Observation(
             images=observation.images,
             state=observation.state,
             instruction=None,
+            image_times=observation.image_times,
+            state_time=observation.state_time,
         )
 
     def close(self) -> None:
@@ -1710,6 +1794,7 @@ class YAMEmbodiment:
         # abort between bind_task and the first reset) must not carry a stale
         # horizon into a later framework-less run.
         self._bound_max_steps = None
+        self._strict_reference = None
         self._resolved_start_pose = None
         # A reconnect re-reads a named start pose from its (possibly edited)
         # file, so the EEF box validation must re-run with it. Revalidating a
@@ -1792,6 +1877,52 @@ class YAMEmbodiment:
         return sent
 
     # -- internals ---------------------------------------------------------
+
+    def _require_camera_configuration(self) -> None:
+        """Fail before driver construction when no usable camera source exists."""
+        if self._camera_reader is _default_camera_reader or not callable(self._camera_reader):
+            raise ConfigError(
+                "yam_arms has no cameras configured. Set exactly one source per "
+                "camera slot: *_cam_device for V4L2 colour or *_depth_serial for "
+                "RealSense colour+depth, in YamConfig, config.ini "
+                "([embodiment.args]), or the CLI; or provide a custom "
+                "camera_reader= via the Python API."
+            )
+
+    def _strict_policy_target(
+        self,
+        raw: npt.ArrayLike,
+        *,
+        reference: npt.ArrayLike | None = None,
+    ) -> Vec:
+        """Abort without rewriting a malformed, out-of-bounds, or jumping target."""
+        try:
+            target = packing.validate_dim(raw)
+        except (TypeError, ValueError) as exc:
+            raise SafetyAbort("strict policy action must contain exactly 14 finite values") from exc
+        if not bool(np.all(np.isfinite(target))):
+            raise SafetyAbort("strict policy action must contain exactly 14 finite values")
+        outside = np.flatnonzero((target < self._cfg.low) | (target > self._cfg.high))
+        if outside.size:
+            labels = ", ".join(packing.DIM_LABELS[int(index)] for index in outside)
+            raise SafetyAbort(f"strict policy action is outside configured joint bounds: {labels}")
+        resolved_reference = self._strict_reference if reference is None else reference
+        if resolved_reference is None:
+            raise RuntimeError("strict policy action requires reset() before step()")
+        try:
+            resolved_reference = packing.validate_dim(resolved_reference)
+        except (TypeError, ValueError) as exc:
+            raise SafetyAbort(
+                "strict policy reference must contain exactly 14 finite values"
+            ) from exc
+        if not bool(np.all(np.isfinite(resolved_reference))):
+            raise SafetyAbort("strict policy reference must contain exactly 14 finite values")
+        limits = np.asarray(self._cfg.step_limits, dtype=np.float64)
+        jumps = np.flatnonzero(np.abs(target - resolved_reference) > limits)
+        if jumps.size:
+            labels = ", ".join(packing.DIM_LABELS[int(index)] for index in jumps)
+            raise SafetyAbort(f"strict policy action jump exceeds configured limit: {labels}")
+        return target
 
     def _action_space(self) -> Box:
         """Build the declared action contract selected by the configuration."""
@@ -2097,7 +2228,9 @@ class YAMEmbodiment:
                 )
             joint_eff = packing.validate_dim(get_joint_eff())
 
-        images = dict(self._camera_reader(self._cfg))
+        captured = self._camera_reader(self._cfg)
+        images = dict(captured)
+        image_times = dict(captured.image_times) if isinstance(captured, _CapturedImages) else {}
         expected_shape = (self._cfg.cam_height, self._cfg.cam_width, 3)
         for name, img in images.items():
             # A dropped frame violates the ImageMap contract, but name the camera
@@ -2121,7 +2254,12 @@ class YAMEmbodiment:
         if joint_eff is not None:
             values["joint_eff"] = joint_eff
         if self._builtin_realsense_reader is None and self._depth_reader is None:
-            return Observation(images=images, state=values, instruction=instruction)
+            return Observation(
+                images=images,
+                state=values,
+                instruction=instruction,
+                image_times=image_times,
+            )
         extra: dict[str, Any] = {}
         if self._builtin_realsense_reader is not None:
             extra.update(self._builtin_realsense_reader.extra(self._cfg))
@@ -2131,5 +2269,6 @@ class YAMEmbodiment:
             images=images,
             state=values,
             instruction=instruction,
+            image_times=image_times,
             extra=extra,
         )

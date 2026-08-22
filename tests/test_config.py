@@ -176,6 +176,18 @@ def test_yam_control_interface_validation() -> None:
 
 
 @pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"control_interface": "eef_pos"},
+        {"joints_are_delta": True},
+    ],
+)
+def test_strict_policy_actions_require_absolute_joint_control(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match="requires absolute joint control"):
+        YamConfig(strict_policy_actions=True, **kwargs)
+
+
+@pytest.mark.parametrize(
     ("kwargs", "message"),
     [
         ({"eef_low": (0.0,) * 13}, "eef_low must have 14"),
@@ -580,10 +592,21 @@ def test_report_joint_eff_defaults_off_and_binds_via_kwargs() -> None:
     assert YamConfig.from_kwargs(report_joint_eff=True).report_joint_eff is True
 
 
+def test_strict_policy_actions_defaults_off_and_binds_via_kwargs() -> None:
+    assert YamConfig().strict_policy_actions is False
+    assert YamConfig.from_kwargs(strict_policy_actions=True).strict_policy_actions is True
+
+
 @pytest.mark.parametrize("value", [None, "yes", 1])
 def test_report_joint_eff_rejects_non_bool_values(value: object) -> None:
     with pytest.raises(ValueError, match="report_joint_eff must be true or false"):
         YamConfig.from_kwargs(report_joint_eff=value)
+
+
+@pytest.mark.parametrize("value", [None, "yes", 1])
+def test_strict_policy_actions_rejects_non_bool_values(value: object) -> None:
+    with pytest.raises(ValueError, match="strict_policy_actions must be true or false"):
+        YamConfig.from_kwargs(strict_policy_actions=value)
 
 
 @pytest.mark.parametrize("value", [True, False])

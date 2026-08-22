@@ -35,7 +35,7 @@ OPEN_TIMEOUT_S = 45.0
 #: 10 x 50 ms staleness loop re-invoking the read.
 SEQLOCK_READ_RETRIES = 3
 
-_HEADER = struct.Struct("<QdQd")
+_HEADER = struct.Struct("<QddQd")
 _SEQUENCE = struct.Struct("<Q")
 
 
@@ -90,6 +90,7 @@ class _FrameSnapshot:
     intrinsics: npt.NDArray[np.float32]
     depth_scale: float
     published_s: float
+    captured_epoch_s: float
     generation: int
 
 
@@ -473,6 +474,7 @@ def _publish_frameset(
         intrinsics=k_matrix,
         depth_scale=depth_scale,
         published_s=time.monotonic(),
+        captured_epoch_s=time.time(),
         generation=generation,
     )
 
@@ -512,13 +514,14 @@ def _write_frame(
     intrinsics: npt.NDArray[np.float32],
     depth_scale: float,
     published_s: float,
+    captured_epoch_s: float,
     generation: int,
 ) -> None:
     """Publish one frame, leaving an odd sequence behind if copying fails.
 
-    ``published_s`` is stamped from ``time.monotonic()`` by the child. That
-    clock is boot-relative and machine-wide on Linux and macOS, which lets the
-    parent compare it with its own monotonic clock.
+    ``published_s`` is stamped from ``time.monotonic()`` by the child for local
+    freshness checks. ``captured_epoch_s`` is the distinct host Unix-epoch
+    acquisition time carried to the policy boundary.
     """
     layout = spec.layout
     buffer = _buffer(shm)
@@ -529,6 +532,7 @@ def _write_frame(
         0,
         odd_sequence,
         published_s,
+        captured_epoch_s,
         generation,
         depth_scale,
     )
@@ -569,7 +573,9 @@ def _read_frame(
     """Copy a coherent publication, or return ``None`` after bounded retries."""
     buffer = _buffer(shm)
     for _ in range(retries):
-        sequence, published_s, generation, depth_scale = _HEADER.unpack_from(buffer)
+        sequence, published_s, captured_epoch_s, generation, depth_scale = _HEADER.unpack_from(
+            buffer
+        )
         if sequence == 0 or sequence % 2:
             continue
         colour, depth, intrinsics = _copy_payload(buffer, spec.layout)
@@ -581,6 +587,7 @@ def _read_frame(
                 intrinsics=intrinsics,
                 depth_scale=depth_scale,
                 published_s=published_s,
+                captured_epoch_s=captured_epoch_s,
                 generation=generation,
             )
     del buffer

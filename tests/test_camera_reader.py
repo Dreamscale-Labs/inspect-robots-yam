@@ -11,7 +11,7 @@ rather than left running for the session. Nothing sleeps on the wall clock:
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import numpy as np
@@ -20,7 +20,12 @@ import pytest
 
 from conftest import FakeCapture, FakeCv2, frame
 from inspect_robots_yam.config import YamConfig
-from inspect_robots_yam.embodiment import YAMEmbodiment, _OpenCVCameraReader
+from inspect_robots_yam.embodiment import (
+    YAMEmbodiment,
+    _CapturedImages,
+    _CompositeCameraReader,
+    _OpenCVCameraReader,
+)
 
 DEVICES = {"top_cam": "/dev/cam0", "left_cam": "/dev/cam1", "right_cam": "/dev/cam2"}
 
@@ -55,13 +60,20 @@ class Clock:
 def build(
     caps: dict[str, FakeCapture] | None = None,
     clock: Clock | None = None,
+    epoch_clock: Callable[[], float] | None = None,
 ) -> tuple[_OpenCVCameraReader, FakeCv2, list[float], Clock]:
     """A reader wired to fakes, plus the recorded sleeps and the clock."""
     caps = caps if caps is not None else {device: FakeCapture() for device in DEVICES.values()}
     cv2 = FakeCv2(caps)
     sleeps: list[float] = []
     clock = clock if clock is not None else Clock()
-    reader = _OpenCVCameraReader(DEVICES, cv2_module=cv2, sleep_fn=sleeps.append, clock=clock)
+    reader = _OpenCVCameraReader(
+        DEVICES,
+        cv2_module=cv2,
+        sleep_fn=sleeps.append,
+        clock=clock,
+        epoch_clock=epoch_clock or (lambda: 1_700_000_000.0),
+    )
     _OPENED.append(reader)
     return reader, cv2, sleeps, clock
 
@@ -286,6 +298,49 @@ def test_the_warm_up_seeds_the_slot_so_the_first_observation_needs_no_drain() ->
         reader.close()
 
     assert set(images) == set(DEVICES)
+
+
+def test_opencv_reader_returns_per_camera_epoch_capture_times() -> None:
+    epochs = iter((1_700_000_000.001, 1_700_000_000.002, 1_700_000_000.003))
+    reader, _, _, _ = build(epoch_clock=lambda: next(epochs))
+    for name, fill in zip(DEVICES, (1, 2, 3), strict=True):
+        drive(reader, name, FakeCapture([(True, frame(fill))], idle_from=None), iterations=1)
+    reader._caps = {"already-open": object()}
+
+    captured = reader(YamConfig())
+
+    assert captured.image_times == {
+        "top_cam": 1_700_000_000.001,
+        "left_cam": 1_700_000_000.002,
+        "right_cam": 1_700_000_000.003,
+    }
+    assert set(captured) == set(DEVICES)
+    assert len(captured) == 3
+
+
+def test_composite_reader_preserves_each_child_capture_time() -> None:
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    top = _CapturedImages({"top_cam": image}, {"top_cam": 1_700_000_000.001})
+    wrists = _CapturedImages(
+        {"left_cam": image, "right_cam": image},
+        {"left_cam": 1_700_000_000.002, "right_cam": 1_700_000_000.003},
+    )
+    composite = _CompositeCameraReader(lambda _cfg: top, lambda _cfg: wrists)
+
+    captured = composite(YamConfig())
+
+    assert set(captured) == set(DEVICES)
+    assert captured.image_times == {**top.image_times, **wrists.image_times}
+
+
+def test_composite_reader_keeps_legacy_custom_mapping_compatible() -> None:
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    composite = _CompositeCameraReader(lambda _cfg: {"top_cam": image})
+
+    captured = composite(YamConfig())
+
+    assert set(captured) == {"top_cam"}
+    assert captured.image_times == {}
 
 
 class ClosingReader:

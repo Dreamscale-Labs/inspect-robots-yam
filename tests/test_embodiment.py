@@ -11,7 +11,7 @@ from typing import NoReturn, cast
 import numpy as np
 import pytest
 from inspect_robots.embodiment import SELF_PACED
-from inspect_robots.errors import ConfigError, EmbodimentFault
+from inspect_robots.errors import ConfigError, EmbodimentFault, SafetyAbort
 from inspect_robots.scene import Scene
 from inspect_robots.types import Action
 
@@ -22,7 +22,7 @@ from inspect_robots_yam.config import (
     DEFAULT_REST_POSE,
     YamConfig,
 )
-from inspect_robots_yam.embodiment import BimanualDriver, YAMEmbodiment
+from inspect_robots_yam.embodiment import BimanualDriver, YAMEmbodiment, _CapturedImages
 from inspect_robots_yam.operator import OperatorIO
 
 
@@ -172,6 +172,74 @@ def test_reset_returns_observation_and_homes() -> None:
     assert home_cmd[0] == pytest.approx(0.1)
     assert home_cmd[6] == pytest.approx(19.0)  # 20 + 0.1 * (10 - 20)
     assert home_cmd[13] == pytest.approx(19.0)
+
+
+def test_prepare_observation_opens_once_without_sending_any_arm_command() -> None:
+    driver = FakeDriver()
+    factory_calls: list[YamConfig] = []
+    emb = YAMEmbodiment(
+        YamConfig(cam_height=4, cam_width=4),
+        driver_factory=lambda cfg: factory_calls.append(cfg) or driver,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+
+    observation = emb.prepare_observation("shadow")
+
+    assert observation.instruction == "shadow"
+    assert observation.state["joint_pos"] == pytest.approx(np.zeros(14))
+    assert len(factory_calls) == 1
+    assert driver.commands == []
+
+    second = emb.prepare_observation("shadow again")
+    assert second.instruction == "shadow again"
+    assert len(factory_calls) == 1
+    assert driver.commands == []
+
+    emb.reset(Scene(id="s", instruction="live"))
+    assert len(factory_calls) == 1
+    assert driver.commands
+
+
+def test_observe_parked_preserves_fresh_per_camera_capture_times() -> None:
+    calls = 0
+
+    def timed_cameras(_cfg: YamConfig) -> _CapturedImages:
+        nonlocal calls
+        calls += 1
+        image = np.zeros((4, 4, 3), dtype=np.uint8)
+        base = 1_700_000_000.0 + calls
+        return _CapturedImages(
+            images={"top_cam": image, "left_cam": image, "right_cam": image},
+            image_times={
+                "top_cam": base + 0.001,
+                "left_cam": base + 0.002,
+                "right_cam": base + 0.003,
+            },
+        )
+
+    driver = EchoDriver()
+    emb = YAMEmbodiment(
+        YamConfig(cam_height=4, cam_width=4, rest_secs=0.1),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=timed_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    emb.reset(Scene(id="s", instruction="live"))
+
+    parked = emb.observe_parked()
+
+    assert parked is not None
+    assert parked.instruction is None
+    assert parked.image_times == {
+        "top_cam": 1_700_000_002.001,
+        "left_cam": 1_700_000_002.002,
+        "right_cam": 1_700_000_002.003,
+    }
 
 
 def _save_start_pose(directory: Path, name: str, values: tuple[float, ...]) -> None:
@@ -427,6 +495,195 @@ def test_step_clamps_to_limits() -> None:
     assert cmd[0] == pytest.approx(np.pi)  # joint clamped
     # Wire gripper 1 is open and stays driver 1.0 under the default identity calibration.
     assert cmd[6] == pytest.approx(1.0)
+
+
+def _strict_build(driver: FakeDriver | None = None) -> tuple[YAMEmbodiment, FakeDriver]:
+    actual = driver or EchoDriver()
+    embodiment, _, _ = _build(
+        YamConfig(strict_policy_actions=True, rest_secs=0.1),
+        driver=actual,
+    )
+    embodiment.reset(Scene(id="strict", instruction="move"))
+    return embodiment, actual
+
+
+def test_strict_policy_actions_accept_exact_first_and_subsequent_boundaries() -> None:
+    emb, driver = _strict_build()
+    command_count = len(driver.commands)
+    first = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    first[0] = 0.2
+    first[6] = 0.0
+    second = first.copy()
+    second[0] = 0.4
+    second[6] = 1.0
+
+    emb.step(Action(first))
+    emb.step(Action(second))
+
+    assert len(driver.commands) == command_count + 2
+    np.testing.assert_array_equal(driver.commands[-2], first)
+    np.testing.assert_array_equal(driver.commands[-1], second)
+
+
+def test_strict_policy_actions_abort_first_jump_without_sending() -> None:
+    emb, driver = _strict_build()
+    command_count = len(driver.commands)
+    target = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    target[0] = 0.200_001
+
+    with pytest.raises(SafetyAbort, match=r"jump.*left_j0"):
+        emb.step(Action(target))
+
+    assert len(driver.commands) == command_count
+
+
+def test_strict_policy_action_requires_reset_after_preparation() -> None:
+    driver = FakeDriver()
+    emb = YAMEmbodiment(
+        YamConfig(
+            cam_height=4,
+            cam_width=4,
+            strict_policy_actions=True,
+        ),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    emb.prepare_observation("shadow")
+
+    with pytest.raises(RuntimeError, match=r"requires reset\(\)"):
+        emb.step(Action(np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)))
+
+    assert driver.commands == []
+
+
+def test_validate_policy_action_uses_explicit_reference_without_sending() -> None:
+    driver = FakeDriver()
+    emb = YAMEmbodiment(
+        YamConfig(
+            cam_height=4,
+            cam_width=4,
+            strict_policy_actions=True,
+        ),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    observation = emb.prepare_observation("shadow")
+    reference = observation.state["joint_pos"]
+    target = np.asarray(reference, dtype=np.float64).copy()
+    target[0] = 0.2
+
+    validated = emb.validate_policy_action(Action(target), reference=reference)
+
+    np.testing.assert_array_equal(validated, target)
+    assert driver.commands == []
+
+
+def test_validate_policy_action_requires_strict_mode() -> None:
+    emb, _, _ = _build(YamConfig(rest_secs=0.1))
+
+    with pytest.raises(RuntimeError, match="strict_policy_actions=True"):
+        emb.validate_policy_action(Action(np.zeros(14)), reference=np.zeros(14))
+
+
+@pytest.mark.parametrize("reference", [np.zeros(13), np.full(14, np.nan)])
+def test_validate_policy_action_rejects_invalid_explicit_reference_without_sending(
+    reference: np.ndarray,
+) -> None:
+    driver = FakeDriver()
+    emb = YAMEmbodiment(
+        YamConfig(cam_height=4, cam_width=4, strict_policy_actions=True),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    emb.prepare_observation("shadow")
+
+    with pytest.raises(SafetyAbort, match=r"reference.*exactly 14 finite"):
+        emb.validate_policy_action(Action(np.zeros(14)), reference=reference)
+
+    assert driver.commands == []
+
+
+def test_strict_policy_actions_compare_later_targets_with_last_accepted_target() -> None:
+    emb, driver = _strict_build()
+    first = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    first[0] = 0.2
+    emb.step(Action(first))
+    command_count = len(driver.commands)
+    rejected = first.copy()
+    rejected[0] = 0.400_001
+
+    with pytest.raises(SafetyAbort, match=r"jump.*left_j0"):
+        emb.step(Action(rejected))
+
+    assert len(driver.commands) == command_count
+
+
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [
+        (np.full(14, np.nan), "finite"),
+        (np.zeros(13), "exactly 14"),
+        (np.full(14, np.pi + 0.01), "bounds"),
+    ],
+)
+def test_strict_policy_actions_abort_malformed_or_out_of_bounds_without_sending(
+    target: np.ndarray,
+    message: str,
+) -> None:
+    emb, driver = _strict_build()
+    command_count = len(driver.commands)
+
+    with pytest.raises(SafetyAbort, match=message):
+        emb.step(Action(target))
+
+    assert len(driver.commands) == command_count
+
+
+def test_strict_reference_resets_to_fresh_measured_state_between_trials() -> None:
+    emb, driver = _strict_build()
+    first = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    first[0] = 0.2
+    emb.step(Action(first))
+
+    emb.reset(Scene(id="strict-2", instruction="move again"))
+    opposite = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    opposite[0] = -0.2
+    emb.step(Action(opposite))
+
+    np.testing.assert_array_equal(driver.commands[-1], opposite)
+
+
+def test_strict_reference_updates_only_after_driver_command_succeeds() -> None:
+    class FailingActionDriver(EchoDriver):
+        fail_next = False
+
+        def command_joint_pos(self, target: np.ndarray) -> None:
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("driver send failed")
+            super().command_joint_pos(target)
+
+    driver = FailingActionDriver()
+    emb, _ = _strict_build(driver)
+    failed = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    failed[0] = 0.1
+    driver.fail_next = True
+    with pytest.raises(RuntimeError, match="driver send failed"):
+        emb.step(Action(failed))
+
+    from_measured = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    from_measured[0] = -0.2
+    emb.step(Action(from_measured))
+    np.testing.assert_array_equal(driver.commands[-1], from_measured)
 
 
 def test_step_gripper_denormalization() -> None:
