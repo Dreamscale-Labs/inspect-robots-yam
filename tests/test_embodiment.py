@@ -559,6 +559,38 @@ def test_strict_policy_action_requires_reset_after_preparation() -> None:
     assert driver.commands == []
 
 
+def test_validate_policy_action_uses_explicit_reference_without_sending() -> None:
+    driver = FakeDriver()
+    emb = YAMEmbodiment(
+        YamConfig(
+            cam_height=4,
+            cam_width=4,
+            strict_policy_actions=True,
+        ),
+        driver_factory=lambda _cfg: driver,
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    observation = emb.prepare_observation("shadow")
+    reference = observation.state["joint_pos"]
+    target = np.asarray(reference, dtype=np.float64).copy()
+    target[0] = 0.2
+
+    validated = emb.validate_policy_action(Action(target), reference=reference)
+
+    np.testing.assert_array_equal(validated, target)
+    assert driver.commands == []
+
+
+def test_validate_policy_action_requires_strict_mode() -> None:
+    emb, _, _ = _build(YamConfig(rest_secs=0.1))
+
+    with pytest.raises(RuntimeError, match="strict_policy_actions=True"):
+        emb.validate_policy_action(Action(np.zeros(14)), reference=np.zeros(14))
+
+
 def test_strict_policy_actions_compare_later_targets_with_last_accepted_target() -> None:
     emb, driver = _strict_build()
     first = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)

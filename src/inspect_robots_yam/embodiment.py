@@ -1671,6 +1671,23 @@ class YAMEmbodiment:
             self._driver = self._driver_factory(self._cfg)
         return self._observe(instruction)
 
+    def validate_policy_action(
+        self,
+        action: Action,
+        *,
+        reference: npt.ArrayLike | None = None,
+    ) -> Vec:
+        """Validate one strict action without commanding or changing guard state.
+
+        ``reference`` lets a pre-home shadow inference be checked against the
+        real state returned by :meth:`prepare_observation`. When omitted, the
+        live post-reset/last-accepted strict reference is used. The method is
+        intentionally unavailable outside opt-in strict policy-action mode.
+        """
+        if not self._cfg.strict_policy_actions:
+            raise RuntimeError("validate_policy_action requires strict_policy_actions=True")
+        return self._strict_policy_target(action.data, reference=reference).copy()
+
     def step(self, action: Action) -> StepResult:
         """Clamp + command one action, pace to the control rate, then maybe end."""
         driver = self._require_driver()
@@ -1872,7 +1889,12 @@ class YAMEmbodiment:
                 "camera_reader= via the Python API."
             )
 
-    def _strict_policy_target(self, raw: npt.ArrayLike) -> Vec:
+    def _strict_policy_target(
+        self,
+        raw: npt.ArrayLike,
+        *,
+        reference: npt.ArrayLike | None = None,
+    ) -> Vec:
         """Abort without rewriting a malformed, out-of-bounds, or jumping target."""
         try:
             target = packing.validate_dim(raw)
@@ -1884,11 +1906,19 @@ class YAMEmbodiment:
         if outside.size:
             labels = ", ".join(packing.DIM_LABELS[int(index)] for index in outside)
             raise SafetyAbort(f"strict policy action is outside configured joint bounds: {labels}")
-        reference = self._strict_reference
-        if reference is None:
+        resolved_reference = self._strict_reference if reference is None else reference
+        if resolved_reference is None:
             raise RuntimeError("strict policy action requires reset() before step()")
+        try:
+            resolved_reference = packing.validate_dim(resolved_reference)
+        except (TypeError, ValueError) as exc:
+            raise SafetyAbort(
+                "strict policy reference must contain exactly 14 finite values"
+            ) from exc
+        if not bool(np.all(np.isfinite(resolved_reference))):
+            raise SafetyAbort("strict policy reference must contain exactly 14 finite values")
         limits = np.asarray(self._cfg.step_limits, dtype=np.float64)
-        jumps = np.flatnonzero(np.abs(target - reference) > limits)
+        jumps = np.flatnonzero(np.abs(target - resolved_reference) > limits)
         if jumps.size:
             labels = ", ".join(packing.DIM_LABELS[int(index)] for index in jumps)
             raise SafetyAbort(f"strict policy action jump exceeds configured limit: {labels}")
