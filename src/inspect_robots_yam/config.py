@@ -181,9 +181,9 @@ class YamConfig(_FromKwargs):
     joints_are_delta: bool = False
     step_limits: tuple[float, ...] = _DEFAULT_STEP_LIMITS
     # Opt-in policy boundary for attended physical runs. Absolute policy targets
-    # must be finite, inside joint bounds, and within step_limits of the freshly
-    # measured post-reset state or last successfully commanded target. Rejected
-    # actions abort instead of being clamped, held, or rewritten.
+    # must be finite and within step_limits of the freshly measured post-reset
+    # state or last successfully commanded target. Bounds violations abort unless
+    # one of the explicit, recorded endpoint-projection options below is enabled.
     strict_policy_actions: bool = False
     # DreamZero-YAM's published raw_absolute_joint gripper targets legitimately
     # extend beyond the calibrated [0, 1] I2RT command stroke. This opt-in keeps
@@ -191,6 +191,12 @@ class YamConfig(_FromKwargs):
     # two continuous gripper slots to the nearest calibrated endpoint. The
     # projection is surfaced to the operator and in StepResult.info.
     strict_gripper_endpoint_projection: bool = False
+    # Preserve the standard YAM joint-limit backstop without making it silent:
+    # project only out-of-range arm slots to their configured safe endpoint,
+    # record requested/applied values, and still apply the strict jump limit to
+    # the projected target before any driver command. Gross/discontinuous model
+    # output therefore aborts even when this option is enabled.
+    strict_arm_endpoint_projection: bool = False
     zero_gravity_mode: bool = True
     unattended: bool = False
     # Skip both operator Enter gates in reset(): the stand-clear home gate is
@@ -304,6 +310,7 @@ class YamConfig(_FromKwargs):
             "park_before_grade",
             "strict_policy_actions",
             "strict_gripper_endpoint_projection",
+            "strict_arm_endpoint_projection",
         ):
             if flag in flat and not isinstance(flat[flag], bool):
                 raise ValueError(f"{flag} must be true or false, got {flat[flag]!r}")
@@ -353,6 +360,10 @@ class YamConfig(_FromKwargs):
         if self.strict_gripper_endpoint_projection and not self.strict_policy_actions:
             raise ValueError(
                 "strict_gripper_endpoint_projection=True requires strict_policy_actions=True"
+            )
+        if self.strict_arm_endpoint_projection and not self.strict_policy_actions:
+            raise ValueError(
+                "strict_arm_endpoint_projection=True requires strict_policy_actions=True"
             )
         for name in ("joint_low", "joint_high"):
             if len(getattr(self, name)) != TOTAL_DIM:

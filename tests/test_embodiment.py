@@ -501,12 +501,16 @@ def _strict_build(
     driver: FakeDriver | None = None,
     *,
     project_gripper_endpoints: bool = False,
+    project_arm_endpoints: bool = False,
+    joint_low: tuple[float, ...] | None = None,
 ) -> tuple[YAMEmbodiment, FakeDriver]:
     actual = driver or EchoDriver()
     embodiment, _, _ = _build(
         YamConfig(
             strict_policy_actions=True,
             strict_gripper_endpoint_projection=project_gripper_endpoints,
+            strict_arm_endpoint_projection=project_arm_endpoints,
+            joint_low=YamConfig().joint_low if joint_low is None else joint_low,
             rest_secs=0.1,
         ),
         driver=actual,
@@ -566,6 +570,58 @@ def test_strict_gripper_endpoint_projection_notice_is_once_per_trial() -> None:
     emb.connect_operator_session(session)
     raw = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
     raw[6] = -0.1
+
+    emb.step(Action(raw))
+    emb.step(Action(raw))
+
+    assert len(session.lines) == 1
+
+
+def test_strict_arm_endpoint_projection_is_explicit_and_keeps_target_in_bounds() -> None:
+    low = list(YamConfig().joint_low)
+    low[9] = -0.15
+    emb, driver = _strict_build(project_arm_endpoints=True, joint_low=tuple(low))
+    session = _RecordingSession()
+    emb.connect_operator_session(session)
+    command_count = len(driver.commands)
+    raw = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    raw[9] = -0.16
+
+    result = emb.step(Action(raw))
+
+    assert len(driver.commands) == command_count + 1
+    applied = driver.commands[-1]
+    assert applied[9] == pytest.approx(-0.15)
+    np.testing.assert_array_equal(applied[np.arange(14) != 9], raw[np.arange(14) != 9])
+    assert result.info["arm_endpoint_projection"] == {
+        "right_j2": {"requested": pytest.approx(-0.16), "applied": pytest.approx(-0.15)}
+    }
+    assert session.lines == [
+        "Notice: DreamZero-YAM requested an arm target beyond a configured joint limit; "
+        "only the affected target was projected to its safe endpoint and recorded."
+    ]
+
+
+def test_strict_arm_endpoint_projection_still_aborts_an_excessive_applied_jump() -> None:
+    emb, driver = _strict_build(project_arm_endpoints=True)
+    command_count = len(driver.commands)
+    raw = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    raw[0] = 100.0
+
+    with pytest.raises(SafetyAbort, match=r"jump.*left_j0"):
+        emb.step(Action(raw))
+
+    assert len(driver.commands) == command_count
+
+
+def test_strict_arm_endpoint_projection_notice_is_once_per_trial() -> None:
+    low = list(YamConfig().joint_low)
+    low[9] = -0.15
+    emb, _driver = _strict_build(project_arm_endpoints=True, joint_low=tuple(low))
+    session = _RecordingSession()
+    emb.connect_operator_session(session)
+    raw = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    raw[9] = -0.16
 
     emb.step(Action(raw))
     emb.step(Action(raw))

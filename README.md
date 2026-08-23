@@ -584,22 +584,29 @@ calibrates `LINEAR_4310` grippers. The same driver is retained for the later
 e-stop and gripper-calibration gate.
 
 `YamConfig(strict_policy_actions=True)` adds an absolute-joint-only policy
-boundary. It requires exactly 14 finite values inside the configured joint
-bounds. The first target is compared with freshly measured post-reset state;
-later targets are compared with the last successfully sent policy target.
-Changes above `step_limits` abort, with defaults of 0.2 rad for arm joints and
-one normalized gripper stroke. A rejected target is not clamped, interpolated,
-held, rewritten, or sent. The reference changes only after the driver command
-succeeds and resets from fresh state on every trial.
+boundary. It requires exactly 14 finite values. The first target is compared
+with freshly measured post-reset state; later targets are compared with the
+last successfully sent policy target. Changes above `step_limits` abort, with
+defaults of 0.2 rad for arm joints and one normalized gripper stroke. Unless an
+endpoint-projection option below is explicitly enabled, a rejected target is
+not clamped, interpolated, held, rewritten, or sent. The reference changes only
+after the driver command succeeds and resets from fresh state on every trial.
 
-DreamZero-YAM is a documented exception for the two gripper slots: its
-`raw_absolute_joint` training outputs span slightly beyond I2RT's calibrated
-normalized stroke. With
-`strict_gripper_endpoint_projection=True`, only `left_gripper` and
-`right_gripper` are projected to the nearest physical endpoint in `[0, 1]`;
-all twelve arm targets remain abort-only and untouched. Each projection is
-returned in `StepResult.info` and announced once per trial, so the hardware
-conversion is never silent. This option requires strict mode and defaults off.
+Two independent endpoint projections are available for compositions that need
+the standard YAM joint-limit backstop without making it silent:
+
+- `strict_gripper_endpoint_projection=True` projects only `left_gripper` and
+  `right_gripper` to the calibrated physical endpoints in `[0, 1]`. This covers
+  DreamZero-YAM's documented continuous gripper overshoot.
+- `strict_arm_endpoint_projection=True` projects only an out-of-range arm slot
+  to its configured joint-limit endpoint. The normal 0.2-rad strict jump check
+  runs on the projected target, so a gross or discontinuous request still
+  aborts before any driver command.
+
+Both options require strict mode and default off. Each changed slot's requested
+and applied values are returned in `StepResult.info`, and the operator is
+notified once per trial, so neither conversion is silent. Malformed, non-finite,
+excessively jumping, and collision-rejected targets always abort.
 
 Strict mode also changes the contributed predictive collision response from a
 hold to `SafetyAbort`. The normal clamp and collision-hold behavior remains
@@ -799,6 +806,9 @@ bounds, and per-step validation for absolute joint policy actions),
 `strict_gripper_endpoint_projection` (default `False`; strict-mode-only,
 operator-visible projection of raw continuous gripper overshoot to calibrated
 `[0, 1]` endpoints),
+`strict_arm_endpoint_projection` (default `False`; strict-mode-only,
+operator-visible projection of out-of-range arm targets to configured joint
+endpoints before the strict jump check),
 `zero_gravity_mode` (default `True`; see *Safety*),
 `unattended` (default `False`; skip operator prompts),
 `auto_start` (default `False`; skip both operator Enter gates but keep the
