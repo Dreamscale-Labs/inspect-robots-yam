@@ -1314,6 +1314,7 @@ class YAMEmbodiment:
         self._driver: BimanualDriver | None = None
         self._strict_reference: Vec | None = None
         self._gripper_projection_notified = False
+        self._arm_projection_notified = False
         self._left_kinematics: _ArmKinematics | None = None
         self._right_kinematics: _ArmKinematics | None = None
         self._eef_home_validated = False
@@ -1656,6 +1657,7 @@ class YAMEmbodiment:
                 self._status(f"Running: press any key to end the episode and grade it.{limit}")
         self.num_steps = 0
         self._gripper_projection_notified = False
+        self._arm_projection_notified = False
         self._t_last = self._clock()
         observation = self._observe(scene.instruction)
         if self._cfg.strict_policy_actions:
@@ -1721,10 +1723,16 @@ class YAMEmbodiment:
         # costs nothing: the pace simply sleeps out whatever is left.
         settle_info = self._settle_info(self._settle(target))
         if self._cfg.strict_policy_actions:
-            projection = self._gripper_projection_info(raw_policy_target, target)
-            if projection:
-                settle_info["gripper_endpoint_projection"] = projection
+            gripper_projection = self._endpoint_projection_info(
+                raw_policy_target, target, _GRIPPER_SLOTS
+            )
+            if gripper_projection:
+                settle_info["gripper_endpoint_projection"] = gripper_projection
                 self._notify_gripper_projection()
+            arm_projection = self._endpoint_projection_info(raw_policy_target, target, _ARM_SLOTS)
+            if arm_projection:
+                settle_info["arm_endpoint_projection"] = arm_projection
+                self._notify_arm_projection()
         self._pace()
         self._emit_status()
 
@@ -1907,7 +1915,7 @@ class YAMEmbodiment:
         *,
         reference: npt.ArrayLike | None = None,
     ) -> Vec:
-        """Abort without rewriting a malformed, out-of-bounds, or jumping target."""
+        """Resolve an opt-in strict target, aborting before any unsafe command."""
         try:
             target = packing.validate_dim(raw)
         except (TypeError, ValueError) as exc:
@@ -1917,6 +1925,13 @@ class YAMEmbodiment:
         if self._cfg.strict_gripper_endpoint_projection:
             target = target.copy()
             target[_GRIPPER_SLOTS] = np.clip(target[_GRIPPER_SLOTS], 0.0, 1.0)
+        if self._cfg.strict_arm_endpoint_projection:
+            target = target.copy()
+            target[_ARM_SLOTS] = np.clip(
+                target[_ARM_SLOTS],
+                self._cfg.low[_ARM_SLOTS],
+                self._cfg.high[_ARM_SLOTS],
+            )
         outside = np.flatnonzero((target < self._cfg.low) | (target > self._cfg.high))
         if outside.size:
             labels = ", ".join(packing.DIM_LABELS[int(index)] for index in outside)
@@ -1939,10 +1954,15 @@ class YAMEmbodiment:
             raise SafetyAbort(f"strict policy action jump exceeds configured limit: {labels}")
         return target
 
-    def _gripper_projection_info(self, raw: Vec, applied: Vec) -> dict[str, dict[str, float]]:
-        """Describe only changed gripper slots; arm values are never projected."""
+    @staticmethod
+    def _endpoint_projection_info(
+        raw: Vec,
+        applied: Vec,
+        slots: npt.NDArray[np.integer[Any]],
+    ) -> dict[str, dict[str, float]]:
+        """Describe requested/applied values for changed endpoint-projected slots."""
         projected: dict[str, dict[str, float]] = {}
-        for index in _GRIPPER_SLOTS:
+        for index in slots:
             slot = int(index)
             requested = float(raw[slot])
             sent = float(applied[slot])
@@ -1966,6 +1986,20 @@ class YAMEmbodiment:
         else:
             logger.warning(notice)
         self._gripper_projection_notified = True
+
+    def _notify_arm_projection(self) -> None:
+        """Make model-to-hardware arm endpoint projection visible once per trial."""
+        if self._arm_projection_notified:
+            return
+        notice = (
+            "Notice: DreamZero-YAM requested an arm target beyond a configured joint limit; "
+            "only the affected target was projected to its safe endpoint and recorded."
+        )
+        if self._session is not None:
+            self._session.write_line(notice)
+        else:
+            logger.warning(notice)
+        self._arm_projection_notified = True
 
     def _action_space(self) -> Box:
         """Build the declared action contract selected by the configuration."""

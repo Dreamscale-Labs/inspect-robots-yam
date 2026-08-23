@@ -611,6 +611,20 @@ def test_strict_gripper_endpoint_projection_requires_strict_mode() -> None:
         YamConfig(strict_gripper_endpoint_projection=True)
 
 
+def test_strict_arm_endpoint_projection_defaults_off_and_binds_with_strict_mode() -> None:
+    assert YamConfig().strict_arm_endpoint_projection is False
+    cfg = YamConfig.from_kwargs(
+        strict_policy_actions=True,
+        strict_arm_endpoint_projection=True,
+    )
+    assert cfg.strict_arm_endpoint_projection is True
+
+
+def test_strict_arm_endpoint_projection_requires_strict_mode() -> None:
+    with pytest.raises(ValueError, match="requires strict_policy_actions=True"):
+        YamConfig(strict_arm_endpoint_projection=True)
+
+
 @pytest.mark.parametrize("value", [None, "yes", 1])
 def test_report_joint_eff_rejects_non_bool_values(value: object) -> None:
     with pytest.raises(ValueError, match="report_joint_eff must be true or false"):
@@ -630,6 +644,15 @@ def test_strict_gripper_endpoint_projection_rejects_non_bool_values(value: objec
         match="strict_gripper_endpoint_projection must be true or false",
     ):
         YamConfig.from_kwargs(strict_gripper_endpoint_projection=value)
+
+
+@pytest.mark.parametrize("value", [None, "yes", 1])
+def test_strict_arm_endpoint_projection_rejects_non_bool_values(value: object) -> None:
+    with pytest.raises(
+        ValueError,
+        match="strict_arm_endpoint_projection must be true or false",
+    ):
+        YamConfig.from_kwargs(strict_arm_endpoint_projection=value)
 
 
 @pytest.mark.parametrize("value", [True, False])
