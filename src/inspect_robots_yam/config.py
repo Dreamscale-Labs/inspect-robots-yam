@@ -185,6 +185,12 @@ class YamConfig(_FromKwargs):
     # measured post-reset state or last successfully commanded target. Rejected
     # actions abort instead of being clamped, held, or rewritten.
     strict_policy_actions: bool = False
+    # DreamZero-YAM's published raw_absolute_joint gripper targets legitimately
+    # extend beyond the calibrated [0, 1] I2RT command stroke. This opt-in keeps
+    # strict abort-only handling for every arm joint while projecting only those
+    # two continuous gripper slots to the nearest calibrated endpoint. The
+    # projection is surfaced to the operator and in StepResult.info.
+    strict_gripper_endpoint_projection: bool = False
     zero_gravity_mode: bool = True
     unattended: bool = False
     # Skip both operator Enter gates in reset(): the stand-clear home gate is
@@ -297,6 +303,7 @@ class YamConfig(_FromKwargs):
             "report_joint_eff",
             "park_before_grade",
             "strict_policy_actions",
+            "strict_gripper_endpoint_projection",
         ):
             if flag in flat and not isinstance(flat[flag], bool):
                 raise ValueError(f"{flag} must be true or false, got {flat[flag]!r}")
@@ -342,6 +349,10 @@ class YamConfig(_FromKwargs):
             raise ValueError(
                 "strict_policy_actions=True requires absolute joint control "
                 "(control_interface='joints', joints_are_delta=False)"
+            )
+        if self.strict_gripper_endpoint_projection and not self.strict_policy_actions:
+            raise ValueError(
+                "strict_gripper_endpoint_projection=True requires strict_policy_actions=True"
             )
         for name in ("joint_low", "joint_high"):
             if len(getattr(self, name)) != TOTAL_DIM:

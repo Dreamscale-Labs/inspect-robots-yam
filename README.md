@@ -592,6 +592,15 @@ one normalized gripper stroke. A rejected target is not clamped, interpolated,
 held, rewritten, or sent. The reference changes only after the driver command
 succeeds and resets from fresh state on every trial.
 
+DreamZero-YAM is a documented exception for the two gripper slots: its
+`raw_absolute_joint` training outputs span slightly beyond I2RT's calibrated
+normalized stroke. With
+`strict_gripper_endpoint_projection=True`, only `left_gripper` and
+`right_gripper` are projected to the nearest physical endpoint in `[0, 1]`;
+all twelve arm targets remain abort-only and untouched. Each projection is
+returned in `StepResult.info` and announced once per trial, so the hardware
+conversion is never silent. This option requires strict mode and defaults off.
+
 Strict mode also changes the contributed predictive collision response from a
 hold to `SafetyAbort`. The normal clamp and collision-hold behavior remains
 unchanged when strict mode is off. A composition using strict mode should not
@@ -674,8 +683,9 @@ motions, or replace the operator and physical e-stop.
   But note the limits are in *policy units* per the table below: gripper slots 6
   and 13 stay normalized 0–1, only slots 0–5 and 7–12 are radians.
 - **Use `ClampApprover`** on hardware for a second layer in normal mode. The
-  Dreamscale strict mode rejects rather than rewrites and must use its
-  abort-only guardrail chain instead.
+  Dreamscale strict mode rejects arm targets rather than rewriting them and
+  must use its abort-only guardrail chain instead. Its explicitly configured
+  gripper-only endpoint projection is the one documented exception above.
 - **Zero-gravity handoff jump.** The arms connect in zero-gravity mode by default
   (`YamConfig(zero_gravity_mode=True)`, passed through to the i2rt driver).
   Homing and rest-pose motions ramp at `control_hz`, but the first *policy*
@@ -786,6 +796,9 @@ at the first reset before torque is released),
 `rest_secs` (ramp duration, default 3.0), `gripper_open/closed`,
 `joints_are_delta`, `strict_policy_actions` (default `False`; abort-only finite,
 bounds, and per-step validation for absolute joint policy actions),
+`strict_gripper_endpoint_projection` (default `False`; strict-mode-only,
+operator-visible projection of raw continuous gripper overshoot to calibrated
+`[0, 1]` endpoints),
 `zero_gravity_mode` (default `True`; see *Safety*),
 `unattended` (default `False`; skip operator prompts),
 `auto_start` (default `False`; skip both operator Enter gates but keep the

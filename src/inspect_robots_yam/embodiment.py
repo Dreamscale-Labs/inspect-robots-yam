@@ -227,6 +227,10 @@ _ARM_SLOTS = np.array(
     ],
     dtype=np.intp,
 )
+_GRIPPER_SLOTS = np.array(
+    (packing.ARM_DOF, packing.ARM_WIDTH + packing.ARM_DOF),
+    dtype=np.intp,
+)
 
 DriverFactory = Callable[[YamConfig], BimanualDriver]
 KinematicsFactory = Callable[[YamConfig], tuple[RawKinematics, RawKinematics]]
@@ -1309,6 +1313,7 @@ class YAMEmbodiment:
 
         self._driver: BimanualDriver | None = None
         self._strict_reference: Vec | None = None
+        self._gripper_projection_notified = False
         self._left_kinematics: _ArmKinematics | None = None
         self._right_kinematics: _ArmKinematics | None = None
         self._eef_home_validated = False
@@ -1650,6 +1655,7 @@ class YAMEmbodiment:
             else:
                 self._status(f"Running: press any key to end the episode and grade it.{limit}")
         self.num_steps = 0
+        self._gripper_projection_notified = False
         self._t_last = self._clock()
         observation = self._observe(scene.instruction)
         if self._cfg.strict_policy_actions:
@@ -1698,6 +1704,7 @@ class YAMEmbodiment:
         else:
             if self._cfg.strict_policy_actions:
                 cmd = self._strict_policy_target(action.data)
+                raw_policy_target = packing.validate_dim(action.data)
             else:
                 cmd = packing.validate_dim(action.data)
             if self._cfg.joints_are_delta:
@@ -1713,6 +1720,11 @@ class YAMEmbodiment:
         # Before _pace(), so a settle that finishes inside the control period
         # costs nothing: the pace simply sleeps out whatever is left.
         settle_info = self._settle_info(self._settle(target))
+        if self._cfg.strict_policy_actions:
+            projection = self._gripper_projection_info(raw_policy_target, target)
+            if projection:
+                settle_info["gripper_endpoint_projection"] = projection
+                self._notify_gripper_projection()
         self._pace()
         self._emit_status()
 
@@ -1902,6 +1914,9 @@ class YAMEmbodiment:
             raise SafetyAbort("strict policy action must contain exactly 14 finite values") from exc
         if not bool(np.all(np.isfinite(target))):
             raise SafetyAbort("strict policy action must contain exactly 14 finite values")
+        if self._cfg.strict_gripper_endpoint_projection:
+            target = target.copy()
+            target[_GRIPPER_SLOTS] = np.clip(target[_GRIPPER_SLOTS], 0.0, 1.0)
         outside = np.flatnonzero((target < self._cfg.low) | (target > self._cfg.high))
         if outside.size:
             labels = ", ".join(packing.DIM_LABELS[int(index)] for index in outside)
@@ -1923,6 +1938,34 @@ class YAMEmbodiment:
             labels = ", ".join(packing.DIM_LABELS[int(index)] for index in jumps)
             raise SafetyAbort(f"strict policy action jump exceeds configured limit: {labels}")
         return target
+
+    def _gripper_projection_info(self, raw: Vec, applied: Vec) -> dict[str, dict[str, float]]:
+        """Describe only changed gripper slots; arm values are never projected."""
+        projected: dict[str, dict[str, float]] = {}
+        for index in _GRIPPER_SLOTS:
+            slot = int(index)
+            requested = float(raw[slot])
+            sent = float(applied[slot])
+            if requested != sent:
+                projected[packing.DIM_LABELS[slot]] = {
+                    "requested": requested,
+                    "applied": sent,
+                }
+        return projected
+
+    def _notify_gripper_projection(self) -> None:
+        """Make the model-to-hardware endpoint projection visible once per trial."""
+        if self._gripper_projection_notified:
+            return
+        notice = (
+            "Notice: DreamZero-YAM requested a gripper target beyond the calibrated stroke; "
+            "the gripper-only target was projected to its safe endpoint and recorded."
+        )
+        if self._session is not None:
+            self._session.write_line(notice)
+        else:
+            logger.warning(notice)
+        self._gripper_projection_notified = True
 
     def _action_space(self) -> Box:
         """Build the declared action contract selected by the configuration."""
