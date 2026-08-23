@@ -497,10 +497,18 @@ def test_step_clamps_to_limits() -> None:
     assert cmd[6] == pytest.approx(1.0)
 
 
-def _strict_build(driver: FakeDriver | None = None) -> tuple[YAMEmbodiment, FakeDriver]:
+def _strict_build(
+    driver: FakeDriver | None = None,
+    *,
+    project_gripper_endpoints: bool = False,
+) -> tuple[YAMEmbodiment, FakeDriver]:
     actual = driver or EchoDriver()
     embodiment, _, _ = _build(
-        YamConfig(strict_policy_actions=True, rest_secs=0.1),
+        YamConfig(
+            strict_policy_actions=True,
+            strict_gripper_endpoint_projection=project_gripper_endpoints,
+            rest_secs=0.1,
+        ),
         driver=actual,
     )
     embodiment.reset(Scene(id="strict", instruction="move"))
@@ -523,6 +531,46 @@ def test_strict_policy_actions_accept_exact_first_and_subsequent_boundaries() ->
     assert len(driver.commands) == command_count + 2
     np.testing.assert_array_equal(driver.commands[-2], first)
     np.testing.assert_array_equal(driver.commands[-1], second)
+
+
+def test_strict_gripper_endpoint_projection_is_explicit_and_leaves_arms_untouched() -> None:
+    emb, driver = _strict_build(project_gripper_endpoints=True)
+    session = _RecordingSession()
+    emb.connect_operator_session(session)
+    command_count = len(driver.commands)
+    raw = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    raw[0] = 0.2
+    raw[6] = -0.2377
+    raw[13] = 1.058
+
+    result = emb.step(Action(raw))
+
+    assert len(driver.commands) == command_count + 1
+    applied = driver.commands[-1]
+    assert applied[0] == pytest.approx(raw[0])
+    assert applied[6] == 0.0
+    assert applied[13] == 1.0
+    assert result.info["gripper_endpoint_projection"] == {
+        "left_gripper": {"requested": pytest.approx(-0.2377), "applied": 0.0},
+        "right_gripper": {"requested": pytest.approx(1.058), "applied": 1.0},
+    }
+    assert session.lines == [
+        "Notice: DreamZero-YAM requested a gripper target beyond the calibrated stroke; "
+        "the gripper-only target was projected to its safe endpoint and recorded."
+    ]
+
+
+def test_strict_gripper_endpoint_projection_notice_is_once_per_trial() -> None:
+    emb, _driver = _strict_build(project_gripper_endpoints=True)
+    session = _RecordingSession()
+    emb.connect_operator_session(session)
+    raw = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    raw[6] = -0.1
+
+    emb.step(Action(raw))
+    emb.step(Action(raw))
+
+    assert len(session.lines) == 1
 
 
 def test_strict_policy_actions_abort_first_jump_without_sending() -> None:
