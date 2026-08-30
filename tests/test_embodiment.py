@@ -591,6 +591,71 @@ def test_validate_policy_action_requires_strict_mode() -> None:
         emb.validate_policy_action(Action(np.zeros(14)), reference=np.zeros(14))
 
 
+def test_policy_action_reference_requires_strict_mode_and_completed_reset() -> None:
+    non_strict, _, _ = _build(YamConfig(rest_secs=0.1))
+    with pytest.raises(RuntimeError, match="strict_policy_actions=True"):
+        non_strict.policy_action_reference()
+
+    strict = YAMEmbodiment(
+        YamConfig(cam_height=4, cam_width=4, strict_policy_actions=True),
+        driver_factory=lambda _cfg: FakeDriver(),
+        camera_reader=_cameras,
+        operator=_operator(),
+        sleep_fn=lambda _delay: None,
+        clock=lambda: 0.0,
+    )
+    strict.prepare_observation("shadow")
+    with pytest.raises(RuntimeError, match=r"requires reset\(\)"):
+        strict.policy_action_reference()
+
+
+def test_policy_action_reference_tracks_only_successfully_sent_targets() -> None:
+    class FailingActionDriver(EchoDriver):
+        fail_next = False
+
+        def command_joint_pos(self, target: np.ndarray) -> None:
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("driver send failed")
+            super().command_joint_pos(target)
+
+    driver = FailingActionDriver()
+    emb, _ = _strict_build(driver)
+    measured = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    np.testing.assert_array_equal(emb.policy_action_reference(), measured)
+
+    caller_copy = emb.policy_action_reference()
+    caller_copy[0] = 99.0
+    np.testing.assert_array_equal(emb.policy_action_reference(), measured)
+
+    failed = measured.copy()
+    failed[0] = 0.1
+    driver.fail_next = True
+    with pytest.raises(RuntimeError, match="driver send failed"):
+        emb.step(Action(failed))
+    np.testing.assert_array_equal(emb.policy_action_reference(), measured)
+
+    accepted = measured.copy()
+    accepted[0] = -0.2
+    emb.step(Action(accepted))
+    np.testing.assert_array_equal(emb.policy_action_reference(), accepted)
+
+
+def test_policy_action_reference_resets_to_fresh_measured_state() -> None:
+    emb, driver = _strict_build()
+    target = np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64)
+    target[0] = 0.2
+    emb.step(Action(target))
+    np.testing.assert_array_equal(emb.policy_action_reference(), target)
+
+    emb.reset(Scene(id="strict-2", instruction="move again"))
+    np.testing.assert_array_equal(
+        emb.policy_action_reference(),
+        np.asarray(DEFAULT_JOINT_HOME_POSE, dtype=np.float64),
+    )
+    assert driver.commands
+
+
 @pytest.mark.parametrize("reference", [np.zeros(13), np.full(14, np.nan)])
 def test_validate_policy_action_rejects_invalid_explicit_reference_without_sending(
     reference: np.ndarray,

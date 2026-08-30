@@ -1688,6 +1688,19 @@ class YAMEmbodiment:
             raise RuntimeError("validate_policy_action requires strict_policy_actions=True")
         return self._strict_policy_target(action.data, reference=reference).copy()
 
+    def policy_action_reference(self) -> Vec:
+        """Return the state against which the next strict action is checked.
+
+        The reference is the freshly observed post-reset state for the first
+        action and the last successfully sent target thereafter. A defensive
+        copy keeps callers from mutating the embodiment's safety state.
+        """
+        if not self._cfg.strict_policy_actions:
+            raise RuntimeError("policy_action_reference requires strict_policy_actions=True")
+        if self._strict_reference is None:
+            raise RuntimeError("policy_action_reference requires reset() before use")
+        return self._strict_reference.copy()
+
     def step(self, action: Action) -> StepResult:
         """Clamp + command one action, pace to the control rate, then maybe end."""
         driver = self._require_driver()
