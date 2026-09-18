@@ -19,7 +19,7 @@ import struct
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from multiprocessing import get_context, resource_tracker, shared_memory
+from multiprocessing import get_context, shared_memory
 from typing import Any
 
 import numpy as np
@@ -495,14 +495,15 @@ def _create_frame_slot(
 
 
 def _attach_frame_slot(spec: _FrameSlotSpec) -> shared_memory.SharedMemory:
-    """Attach without letting the child resource tracker own the parent's name."""
+    """Attach while leaving unlink ownership with the parent process."""
     parameters = inspect.signature(shared_memory.SharedMemory).parameters
     if "track" in parameters:
         kwargs: dict[str, Any] = {"name": spec.name, "track": False}
         return shared_memory.SharedMemory(**kwargs)
-    shm = shared_memory.SharedMemory(name=spec.name)
-    resource_tracker.unregister(vars(shm)["_name"], "shared_memory")
-    return shm
+    # Spawned multiprocessing children share their parent's resource tracker.
+    # Before Python 3.13, attachment registers the same name in that shared set;
+    # manually unregistering it would make the parent's unlink unregister twice.
+    return shared_memory.SharedMemory(name=spec.name)
 
 
 def _write_frame(

@@ -7,11 +7,13 @@ import inspect
 import multiprocessing
 import os
 import struct
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from typing import Any
 
 import numpy as np
@@ -121,7 +123,7 @@ def _record_unregisters(
     """Record child unregister calls without mutating this process's tracker."""
     unregisters: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        capture_proc.resource_tracker,
+        resource_tracker,
         "unregister",
         lambda name, kind: unregisters.append((name, kind)),
     )
@@ -271,7 +273,7 @@ def test_attach_uses_track_false_when_supported(monkeypatch: pytest.MonkeyPatch)
     assert calls == [{"name": "slot", "track": False}]
 
 
-def test_attach_unregisters_on_python_without_track(
+def test_attach_keeps_shared_tracker_registration_on_python_without_track(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeSharedMemory:
@@ -287,7 +289,7 @@ def test_attach_unregisters_on_python_without_track(
         capture_proc.shared_memory, "SharedMemory", lambda **_kwargs: FakeSharedMemory()
     )
     monkeypatch.setattr(
-        capture_proc.resource_tracker,
+        resource_tracker,
         "unregister",
         lambda name, kind: unregisters.append((name, kind)),
     )
@@ -295,7 +297,7 @@ def test_attach_unregisters_on_python_without_track(
     attached = _attach_frame_slot(_FrameSlotSpec("slot", 4, 3))
 
     assert isinstance(attached, FakeSharedMemory)
-    assert unregisters == [("/slot", "shared_memory")]
+    assert unregisters == []
 
 
 def test_capture_process_is_lazy_and_ready_names_are_unlinked() -> None:
@@ -761,15 +763,9 @@ def test_child_opens_warms_publishes_and_stops_in_process(
         ]
         assert pipeline.timeouts == [1000, 1000, 1000]
         assert pipeline.stopped
-        # Same predicate as _attach_frame_slot: on Pythons whose SharedMemory
-        # supports track= (3.13+) the child attaches untracked, so there is
-        # nothing to unregister; older Pythons must unregister the parent's name.
-        supports_track = "track" in inspect.signature(shared_memory.SharedMemory).parameters
-        expected: list[tuple[str, str]] = (
-            [] if supports_track else [(f"/{slot_spec.name}", "shared_memory")]
-        )
+        # Only the parent unlinks names; attachment must never unregister.
         shared_memory_unregisters = [entry for entry in unregisters if entry[1] == "shared_memory"]
-        assert shared_memory_unregisters == expected
+        assert shared_memory_unregisters == []
     finally:
         parent_conn.close()
         shm.close()
@@ -1090,3 +1086,29 @@ def test_child_ignores_incomplete_framesets(
     finally:
         shm.close()
         shm.unlink()
+
+
+def test_spawn_attachment_and_parent_unlink_leave_tracker_clean() -> None:
+    """Exercise the real shared tracker; mocks cannot detect double unregister."""
+    script = """
+from multiprocessing import get_context
+from inspect_robots_yam._capture_proc import _create_frame_slot, _attach_frame_slot
+if __name__ == "__main__":
+    for _ in range(3):
+        shm, spec = _create_frame_slot(4, 3)
+        child = get_context("spawn").Process(target=_attach_frame_slot, args=(spec,))
+        child.start()
+        child.join(10)
+        assert child.exitcode == 0
+        shm.close()
+        shm.unlink()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "KeyError" not in result.stderr, result.stderr
+    assert "leaked shared_memory" not in result.stderr, result.stderr
