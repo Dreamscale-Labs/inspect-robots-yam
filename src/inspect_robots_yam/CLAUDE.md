@@ -42,8 +42,9 @@ The package is `mypy --strict` clean, ships `py.typed`, and is 100%-covered.
   tested against fakes and only the `import cv2` itself is pragma'd.
 - **RealSense capture stays isolated:** `realsense_capture="process"` lazily
   starts one daemon spawn child for all serial-configured cameras. The child
-  unregisters parent-created shared-memory names from its resource tracker; the
-  parent unlinks them immediately after the ready handshake, while both
+  shares the parent resource tracker on Python <3.13 and uses track=False on
+  newer Python. It must not manually unregister names. The parent unlinks them
+  immediately after the ready handshake, while both
   mappings remain usable. Pipe EOF and the stop event end the drain loop.
   Parent close escalates from join to terminate to kill. Shared-memory NumPy
   views are per-read copies and must be discarded before close. Keep
