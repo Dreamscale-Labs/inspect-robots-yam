@@ -23,7 +23,7 @@ Run [Inspect Robots](https://github.com/robocurve/inspect-robots) evals on real
 > This is Dreamscale Labs' hardware integration fork, based on upstream commit
 > `d444fa9ed536d47e659a77e273a72571ff8427d3`. Its additive preparation,
 > source-timestamp, and strict abort behavior is used by the detachable
-> `inspect-robots-dropbear-yam` composition. Upstream behavior remains the
+> `inspect-robots-dreamscale-yam` composition. Upstream behavior remains the
 > default unless strict mode is explicitly enabled.
 
 Inspect Robots has two swappable inputs: a `Policy` (the VLA brain) and an
